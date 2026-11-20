@@ -1,0 +1,1435 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Serverless Bank Management System
+  built using AWS SAM, Lambda, API Gateway, Cognito and DynamoDB.
+
+# Parameters:
+#   RSAPrivateKey:
+#     Type: String
+#     NoEcho: true
+#     MinLength: 1
+#     Description: RSA private key in PEM format used by the registration and login Lambdas.
+
+# --------------------------------------------------
+# GLOBAL LAMBDA CONFIGURATION
+# --------------------------------------------------
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - x86_64
+
+# --------------------------------------------------
+# RESOURCES
+# --------------------------------------------------
+
+Resources:
+
+  # ================================================
+  # RSA PRIVATE KEY - SECRETS MANAGER
+  # ================================================
+
+  RSAPrivateKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: BankManagement/RSA/PrivateKey
+      Description: RSA private key used by customer registration and login Lambdas.
+      GenerateSecretString:
+        SecretStringTemplate: '{"privateKey":"PENDING_UPLOAD"}'
+        GenerateStringKey: bootstrap
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # ================================================
+  # DYNAMODB TABLES
+  # ================================================
+  CustomersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: customers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customerId
+          AttributeType: N
+        - AttributeName: cognitoSub
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customerId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CognitoSubIndex
+          KeySchema:
+            - AttributeName: cognitoSub
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: accounts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: accountId
+          AttributeType: N
+        - AttributeName: customerId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: accountId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIdIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: transactions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: N
+        - AttributeName: accountId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AccountIdIndex
+          KeySchema:
+            - AttributeName: accountId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: notifications
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: notificationId
+          AttributeType: N
+        - AttributeName: customerId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: notificationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIdIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  PendingMaintenancesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: pendingmaintenances
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: accountId
+          AttributeType: N
+        - AttributeName: customerId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: accountId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIdIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # ================================================
+  # COGNITO USER POOL
+  # ================================================
+
+  BankUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: BankManagementUserPool
+
+      UsernameAttributes:
+        - email
+
+      # Registration Lambda confirms new users internally.
+
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+      # Retained because this custom attribute already
+      # exists in the current Cognito User Pool.
+      # Authorization will use Cognito Groups instead.
+      Schema:
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: '1'
+            MaxLength: '20'
+
+  # ================================================
+  # COGNITO APP CLIENT
+  # ================================================
+
+  BankUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: BankManagementAppClient
+      UserPoolId: !Ref BankUserPool
+      GenerateSecret: false
+
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+       # - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+      PreventUserExistenceErrors: ENABLED
+
+  # ================================================
+  # COGNITO GROUPS
+  # ================================================
+
+  AdminUserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ADMIN
+      Description: Bank administrators
+      UserPoolId: !Ref BankUserPool
+      Precedence: 1
+
+  CustomerUserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: CUSTOMER
+      Description: Bank customers
+      UserPoolId: !Ref BankUserPool
+      Precedence: 2
+
+  # ================================================
+  # CREATE CUSTOMER LAMBDA
+  # ================================================
+
+  CreateCustomerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CreateCustomer
+      CodeUri: .
+      Handler: createCustomer.handler
+
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Ref CustomersTable
+          COGNITO_APP_CLIENT_ID: !Ref BankUserPoolClient
+          USER_POOL_ID: !Ref BankUserPool
+          RSA_PRIVATE_KEY_SECRET_ARN: !Ref RSAPrivateKeySecret
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+                - dynamodb:PutItem
+              Resource: !GetAtt CustomersTable.Arn
+
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminConfirmSignUp
+                - cognito-idp:AdminAddUserToGroup
+              Resource: !GetAtt BankUserPool.Arn
+            
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref RSAPrivateKeySecret
+
+      Events:
+        RegisterCustomer:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /customers
+            Method: POST
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/customers/createCustomer.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true 
+
+  # ================================================
+  # GET CUSTOMERS LAMBDA
+  # ================================================
+
+  GetCustomersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetCustomers
+      CodeUri: .
+      Handler: getCustomers.handler
+
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Ref CustomersTable
+
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CustomersTable
+
+      Events:
+        GetCustomers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /customers
+            Method: GET
+            Auth:
+              Authorizer: BankCognitoAuthorizer
+              AuthorizationScopes:
+                - aws.cognito.signin.user.admin
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/customers/getCustomers.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true
+
+
+  # ================================================
+  # GET CUSTOMER BY ID LAMBDA
+  # ================================================
+
+  GetCustomerByIdFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetCustomerById
+      CodeUri: .
+      Handler: getCustomerById.handler
+
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Ref CustomersTable
+          ACCOUNTS_TABLE: !Ref AccountsTable
+
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CustomersTable
+
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${AccountsTable.Arn}/index/CustomerIdIndex"
+
+      Events:
+        GetCustomerById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /customers/{customerId}
+            Method: GET
+            Auth:
+              Authorizer: BankCognitoAuthorizer
+              AuthorizationScopes:
+                - aws.cognito.signin.user.admin
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/customers/getCustomerById.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true
+
+  
+  # ================================================
+  # EDIT CUSTOMER LAMBDA
+  # ================================================
+
+  EditCustomerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: EditCustomer
+      CodeUri: .
+      Handler: editCustomer.handler
+
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Ref CustomersTable
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CustomersTable
+
+      Events:
+        EditCustomer:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /customers/{customerId}
+            Method: PUT
+            Auth:
+              Authorizer: BankCognitoAuthorizer
+              AuthorizationScopes:
+                - aws.cognito.signin.user.admin
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/customers/editCustomer.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true
+
+  # ================================================
+  # DELETE CUSTOMER LAMBDA
+  # ================================================
+
+  DeleteCustomerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: DeleteCustomer
+      CodeUri: .
+      Handler: deleteCustomer.handler
+
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Ref CustomersTable
+          ACCOUNTS_TABLE: !Ref AccountsTable
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CustomersTable
+
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AccountsTable
+
+        # The Lambda queries the accounts GSI and then performs
+        # one atomic transaction across the customer and account tables.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${AccountsTable.Arn}/index/CustomerIdIndex"
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt CustomersTable.Arn
+                - !GetAtt AccountsTable.Arn
+
+      Events:
+        DeleteCustomer:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /customers/{customerId}
+            Method: DELETE
+            Auth:
+              Authorizer: BankCognitoAuthorizer
+              AuthorizationScopes:
+                - aws.cognito.signin.user.admin
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/customers/deleteCustomer.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true
+
+        
+    # ================================================
+  # LOGIN CUSTOMER LAMBDA
+  # ================================================
+
+  LoginCustomerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: LoginCustomer
+      CodeUri: .
+      Handler: loginCustomer.handler
+
+      Environment:
+        Variables:
+          COGNITO_APP_CLIENT_ID: !Ref BankUserPoolClient
+          RSA_PRIVATE_KEY_SECRET_ARN: !Ref RSAPrivateKeySecret
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref RSAPrivateKeySecret
+
+      Events:
+        LoginCustomer:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /login
+            Method: POST
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/login/loginCustomer.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true
+
+ # ================================================
+  # CREATE ACCOUNT LAMBDA
+  # ================================================
+  CreateAccountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CreateAccount
+      CodeUri: .
+      Handler: createAccount.handler
+
+      Environment:
+        Variables:
+          ACCOUNTS_TABLE: !Ref AccountsTable
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+                - dynamodb:PutItem
+              Resource: !GetAtt AccountsTable.Arn
+
+            
+      Events:
+        CreateAccount:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /accounts
+            Method: POST
+            Auth:
+              Authorizer: BankCognitoAuthorizer
+              AuthorizationScopes:
+                - aws.cognito.signin.user.admin
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/accounts/createAccount.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true
+  
+  # ================================================
+  # GET ACCOUNTS LAMBDA
+  # ================================================
+
+  GetAccountsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetAccounts
+      CodeUri: .
+      Handler: GetAccounts.handler
+
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Ref CustomersTable
+          ACCOUNTS_TABLE: !Ref AccountsTable
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !Sub "${CustomersTable.Arn}/index/CognitoSubIndex"
+                - !Sub "${AccountsTable.Arn}/index/CustomerIdIndex"
+
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource: !GetAtt AccountsTable.Arn
+
+      Events:
+        GetAccounts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BankManagementApi
+            Path: /accounts
+            Method: GET
+            Auth:
+              Authorizer: BankCognitoAuthorizer
+              AuthorizationScopes:
+                - aws.cognito.signin.user.admin
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/lambda/accounts/GetAccounts.ts
+        Format: cjs
+        Target: es2022
+        Bundle: true
+        Minify: false
+        Sourcemap: true
+  
+  
+# ================================================
+  # API GATEWAY
+  # ================================================
+
+  BankManagementApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: BankManagementAPI
+      Description: Bank Management REST API
+      StageName: prod
+      EndpointConfiguration: REGIONAL
+
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+      Auth:
+        Authorizers:
+          BankCognitoAuthorizer:
+            UserPoolArn: !GetAtt BankUserPool.Arn
+            Identity:
+              Header: Authorization  
+
+
+# --------------------------------------------------
+# OUTPUTS
+# --------------------------------------------------
+
+Outputs:
+
+  # DynamoDB table names
+
+  CustomersTableName:
+    Description: Customers DynamoDB Table
+    Value: !Ref CustomersTable
+
+  AccountsTableName:
+    Description: Accounts DynamoDB Table
+    Value: !Ref AccountsTable
+
+  TransactionsTableName:
+    Description: Transactions DynamoDB Table
+    Value: !Ref TransactionsTable
+
+  NotificationsTableName:
+    Description: Notifications DynamoDB Table
+    Value: !Ref NotificationsTable
+
+  PendingMaintenancesTableName:
+    Description: Pending Maintenances DynamoDB Table
+    Value: !Ref PendingMaintenancesTable
+
+  # Cognito details
+
+  BankUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref BankUserPool
+
+  BankUserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref BankUserPoolClient
+
+  AdminGroupName:
+    Description: Cognito Administrator Group
+    Value: !Ref AdminUserGroup
+
+  CustomerGroupName:
+    Description: Cognito Customer Group
+    Value: !Ref CustomerUserGroup
+
+  # Customer Lambda ARNs
+
+  CreateCustomerFunctionArn:
+    Description: Create Customer Lambda ARN
+    Value: !GetAtt CreateCustomerFunction.Arn
+
+  GetCustomersFunctionArn:
+    Description: Get Customers Lambda ARN
+    Value: !GetAtt GetCustomersFunction.Arn
+
+  GetCustomerByIdFunctionArn:
+    Description: Get Customer By ID Lambda ARN
+    Value: !GetAtt GetCustomerByIdFunction.Arn
+
+  EditCustomerFunctionArn:
+    Description: Edit Customer Lambda ARN
+    Value: !GetAtt EditCustomerFunction.Arn
+
+  DeleteCustomerFunctionArn:
+    Description: Delete Customer Lambda ARN
+    Value: !GetAtt DeleteCustomerFunction.Arn
+
+  LoginCustomerFunctionArn:
+    Description: Login Customer Lambda ARN
+    Value: !GetAtt LoginCustomerFunction.Arn
+
+  CreateAccountFunctionArn:
+    Description: Create Account Lambda ARN
+    Value: !GetAtt CreateAccountFunction.Arn
+
+  GetAccountsFunctionArn:
+    Description: Get Accounts Lambda ARN
+    Value: !GetAtt GetAccountsFunction.Arn
+
+  # API Gateway details
+
+  BankManagementApiId:
+    Description: Bank Management API Gateway ID
+    Value: !Ref BankManagementApi
+
+  BankManagementApiUrl:
+    Description: Bank Management API Gateway Invoke URL
+    Value: !Sub
+      - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/prod
+      - ApiId: !Ref BankManagementApi
+
+
+
+
+
+
+
+# AWSTemplateFormatVersion: '2010-09-09'
+# Transform: AWS::Serverless-2016-10-31
+
+# Description: >
+#   Serverless Bank Management System
+#   built using AWS SAM, Lambda, API Gateway, Cognito and DynamoDB.
+
+# # --------------------------------------------------
+# # GLOBAL LAMBDA CONFIGURATION
+# # --------------------------------------------------
+
+# Globals:
+#   Function:
+#     Runtime: nodejs24.x
+#     Timeout: 30
+#     MemorySize: 256
+#     Architectures:
+#       - x86_64
+
+# # --------------------------------------------------
+# # RESOURCES
+# # --------------------------------------------------
+
+# Resources:
+
+#   # ================================================
+#   # DYNAMODB TABLES
+#   # ================================================
+
+#   CustomersTable:
+#     Type: AWS::DynamoDB::Table
+#     Properties:
+#       TableName: customers
+#       BillingMode: PAY_PER_REQUEST
+#       AttributeDefinitions:
+#         - AttributeName: customerId
+#           AttributeType: N
+#         - AttributeName: cognitoSub
+#           AttributeType: S
+#       KeySchema:
+#         - AttributeName: customerId
+#           KeyType: HASH
+#       GlobalSecondaryIndexes:
+#         - IndexName: CognitoSubIndex
+#           KeySchema:
+#             - AttributeName: cognitoSub
+#               KeyType: HASH
+#           Projection:
+#             ProjectionType: ALL
+
+#   AccountsTable:
+#     Type: AWS::DynamoDB::Table
+#     Properties:
+#       TableName: accounts
+#       BillingMode: PAY_PER_REQUEST
+#       AttributeDefinitions:
+#         - AttributeName: accountId
+#           AttributeType: N
+#         - AttributeName: customerId
+#           AttributeType: N
+#       KeySchema:
+#         - AttributeName: accountId
+#           KeyType: HASH
+#       GlobalSecondaryIndexes:
+#         - IndexName: CustomerIdIndex
+#           KeySchema:
+#             - AttributeName: customerId
+#               KeyType: HASH
+#           Projection:
+#             ProjectionType: ALL
+
+#   TransactionsTable:
+#     Type: AWS::DynamoDB::Table
+#     Properties:
+#       TableName: transactions
+#       BillingMode: PAY_PER_REQUEST
+#       AttributeDefinitions:
+#         - AttributeName: transactionId
+#           AttributeType: N
+#         - AttributeName: accountId
+#           AttributeType: N
+#       KeySchema:
+#         - AttributeName: transactionId
+#           KeyType: HASH
+#       GlobalSecondaryIndexes:
+#         - IndexName: AccountIdIndex
+#           KeySchema:
+#             - AttributeName: accountId
+#               KeyType: HASH
+#           Projection:
+#             ProjectionType: ALL
+
+#   NotificationsTable:
+#     Type: AWS::DynamoDB::Table
+#     Properties:
+#       TableName: notifications
+#       BillingMode: PAY_PER_REQUEST
+#       AttributeDefinitions:
+#         - AttributeName: notificationId
+#           AttributeType: N
+#         - AttributeName: customerId
+#           AttributeType: N
+#       KeySchema:
+#         - AttributeName: notificationId
+#           KeyType: HASH
+#       GlobalSecondaryIndexes:
+#         - IndexName: CustomerIdIndex
+#           KeySchema:
+#             - AttributeName: customerId
+#               KeyType: HASH
+#           Projection:
+#             ProjectionType: ALL
+
+#   PendingMaintenancesTable:
+#     Type: AWS::DynamoDB::Table
+#     Properties:
+#       TableName: pendingmaintenances
+#       BillingMode: PAY_PER_REQUEST
+#       AttributeDefinitions:
+#         - AttributeName: accountId
+#           AttributeType: N
+#         - AttributeName: customerId
+#           AttributeType: N
+#       KeySchema:
+#         - AttributeName: accountId
+#           KeyType: HASH
+#       GlobalSecondaryIndexes:
+#         - IndexName: CustomerIdIndex
+#           KeySchema:
+#             - AttributeName: customerId
+#               KeyType: HASH
+#           Projection:
+#             ProjectionType: ALL
+
+#   # ================================================
+#   # COGNITO USER POOL
+#   # ================================================
+
+#   BankUserPool:
+#     Type: AWS::Cognito::UserPool
+#     Properties:
+#       UserPoolName: BankManagementUserPool
+
+#       UsernameAttributes:
+#         - email
+
+#       # Registration Lambda confirms new users internally.
+
+#       Policies:
+#         PasswordPolicy:
+#           MinimumLength: 8
+#           RequireUppercase: true
+#           RequireLowercase: true
+#           RequireNumbers: true
+#           RequireSymbols: true
+
+#       # Retained because this custom attribute already
+#       # exists in the current Cognito User Pool.
+#       # Authorization will use Cognito Groups instead.
+#       Schema:
+#         - Name: role
+#           AttributeDataType: String
+#           Mutable: true
+#           StringAttributeConstraints:
+#             MinLength: '1'
+#             MaxLength: '20'
+
+#   # ================================================
+#   # COGNITO APP CLIENT
+#   # ================================================
+
+#   BankUserPoolClient:
+#     Type: AWS::Cognito::UserPoolClient
+#     Properties:
+#       ClientName: BankManagementAppClient
+#       UserPoolId: !Ref BankUserPool
+#       GenerateSecret: false
+
+#       ExplicitAuthFlows:
+#         - ALLOW_USER_PASSWORD_AUTH
+#        # - ALLOW_USER_SRP_AUTH
+#         - ALLOW_REFRESH_TOKEN_AUTH
+
+#       PreventUserExistenceErrors: ENABLED
+
+#   # ================================================
+#   # COGNITO GROUPS
+#   # ================================================
+
+#   AdminUserGroup:
+#     Type: AWS::Cognito::UserPoolGroup
+#     Properties:
+#       GroupName: ADMIN
+#       Description: Bank administrators
+#       UserPoolId: !Ref BankUserPool
+#       Precedence: 1
+
+#   CustomerUserGroup:
+#     Type: AWS::Cognito::UserPoolGroup
+#     Properties:
+#       GroupName: CUSTOMER
+#       Description: Bank customers
+#       UserPoolId: !Ref BankUserPool
+#       Precedence: 2
+
+#   # ================================================
+#   # CREATE CUSTOMER LAMBDA
+#   # ================================================
+
+#   CreateCustomerFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: CreateCustomer
+#       CodeUri: .
+#       Handler: createCustomer.handler
+
+#       Environment:
+#         Variables:
+#           CUSTOMERS_TABLE: !Ref CustomersTable
+#           COGNITO_APP_CLIENT_ID: !Ref BankUserPoolClient
+#           USER_POOL_ID: !Ref BankUserPool
+
+#       Policies:
+#         - Statement:
+#             - Effect: Allow
+#               Action:
+#                 - dynamodb:Scan
+#                 - dynamodb:PutItem
+#               Resource: !GetAtt CustomersTable.Arn
+
+#             - Effect: Allow
+#               Action:
+#                 - cognito-idp:AdminConfirmSignUp
+#                 - cognito-idp:AdminAddUserToGroup
+#               Resource: !GetAtt BankUserPool.Arn
+
+#       Events:
+#         RegisterCustomer:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /customers
+#             Method: POST
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/customers/createCustomer.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+#   # ================================================
+#   # GET CUSTOMERS LAMBDA
+#   # ================================================
+
+#   GetCustomersFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: GetCustomers
+#       CodeUri: .
+#       Handler: getCustomers.handler
+
+#       Environment:
+#         Variables:
+#           CUSTOMERS_TABLE: !Ref CustomersTable
+
+#       Policies:
+#         - DynamoDBReadPolicy:
+#             TableName: !Ref CustomersTable
+
+#       Events:
+#         GetCustomers:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /customers
+#             Method: GET
+#             Auth:
+#               Authorizer: BankCognitoAuthorizer
+#               AuthorizationScopes:
+#                 - aws.cognito.signin.user.admin
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/customers/getCustomers.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+
+#   # ================================================
+#   # GET CUSTOMER BY ID LAMBDA
+#   # ================================================
+
+#   GetCustomerByIdFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: GetCustomerById
+#       CodeUri: .
+#       Handler: getCustomerById.handler
+
+#       Environment:
+#         Variables:
+#           CUSTOMERS_TABLE: !Ref CustomersTable
+#           ACCOUNTS_TABLE: !Ref AccountsTable
+
+#       Policies:
+#         - DynamoDBReadPolicy:
+#             TableName: !Ref CustomersTable
+
+#         - Statement:
+#             - Effect: Allow
+#               Action:
+#                 - dynamodb:Query
+#               Resource: !Sub "${AccountsTable.Arn}/index/CustomerIdIndex"
+
+#       Events:
+#         GetCustomerById:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /customers/{customerId}
+#             Method: GET
+#             Auth:
+#               Authorizer: BankCognitoAuthorizer
+#               AuthorizationScopes:
+#                 - aws.cognito.signin.user.admin
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/customers/getCustomerById.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+
+#   # ================================================
+#   # EDIT CUSTOMER LAMBDA
+#   # ================================================
+
+#   EditCustomerFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: EditCustomer
+#       CodeUri: .
+#       Handler: editCustomer.handler
+
+#       Environment:
+#         Variables:
+#           CUSTOMERS_TABLE: !Ref CustomersTable
+
+#       Policies:
+#         - DynamoDBCrudPolicy:
+#             TableName: !Ref CustomersTable
+
+#       Events:
+#         EditCustomer:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /customers/{customerId}
+#             Method: PUT
+#             Auth:
+#               Authorizer: BankCognitoAuthorizer
+#               AuthorizationScopes:
+#                 - aws.cognito.signin.user.admin
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/customers/editCustomer.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+#   # ================================================
+#   # DELETE CUSTOMER LAMBDA
+#   # ================================================
+
+#   DeleteCustomerFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: DeleteCustomer
+#       CodeUri: .
+#       Handler: deleteCustomer.handler
+
+#       Environment:
+#         Variables:
+#           CUSTOMERS_TABLE: !Ref CustomersTable
+#           ACCOUNTS_TABLE: !Ref AccountsTable
+
+#       Policies:
+#         - DynamoDBCrudPolicy:
+#             TableName: !Ref CustomersTable
+
+#         - DynamoDBCrudPolicy:
+#             TableName: !Ref AccountsTable
+
+#       Events:
+#         DeleteCustomer:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /customers/{customerId}
+#             Method: DELETE
+#             Auth:
+#               Authorizer: BankCognitoAuthorizer
+#               AuthorizationScopes:
+#                 - aws.cognito.signin.user.admin
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/customers/deleteCustomer.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+#   # ================================================
+#   # LOGIN CUSTOMER LAMBDA
+#   # ================================================
+
+#   LoginCustomerFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: LoginCustomer
+#       CodeUri: .
+#       Handler: loginCustomer.handler
+
+#       Environment:
+#         Variables:
+#           COGNITO_APP_CLIENT_ID: !Ref BankUserPoolClient
+
+#       Events:
+#         LoginCustomer:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /login
+#             Method: POST
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/login/loginCustomer.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+
+#   # ================================================
+#   # CREATE ACCOUNT LAMBDA
+#   # ================================================
+#   CreateAccountFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: CreateAccount
+#       CodeUri: .
+#       Handler: createAccount.handler
+
+#       Environment:
+#         Variables:
+#           ACCOUNTS_TABLE: !Ref AccountsTable
+
+#       Policies:
+#         - Statement:
+#             - Effect: Allow
+#               Action:
+#                 - dynamodb:Scan
+#                 - dynamodb:PutItem
+#               Resource: !GetAtt AccountsTable.Arn
+
+            
+#       Events:
+#         CreateAccount:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /accounts
+#             Method: POST
+#             Auth:
+#               Authorizer: BankCognitoAuthorizer
+#               AuthorizationScopes:
+#                 - aws.cognito.signin.user.admin
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/accounts/createAccount.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+  
+#   # ================================================
+#   # GET ACCOUNTS LAMBDA
+#   # ================================================
+
+#   GetAccountsFunction:
+#     Type: AWS::Serverless::Function
+#     Properties:
+#       FunctionName: GetAccounts
+#       CodeUri: .
+#       Handler: GetAccounts.handler
+
+#       Environment:
+#         Variables:
+#           CUSTOMERS_TABLE: !Ref CustomersTable
+#           ACCOUNTS_TABLE: !Ref AccountsTable
+
+#       Policies:
+#         - Statement:
+#             - Effect: Allow
+#               Action:
+#                 - dynamodb:Query
+#               Resource:
+#                 - !Sub "${CustomersTable.Arn}/index/CognitoSubIndex"
+#                 - !Sub "${AccountsTable.Arn}/index/CustomerIdIndex"
+
+#             - Effect: Allow
+#               Action:
+#                 - dynamodb:Scan
+#               Resource: !GetAtt AccountsTable.Arn
+
+#       Events:
+#         GetAccounts:
+#           Type: Api
+#           Properties:
+#             RestApiId: !Ref BankManagementApi
+#             Path: /accounts
+#             Method: GET
+#             Auth:
+#               Authorizer: BankCognitoAuthorizer
+#               AuthorizationScopes:
+#                 - aws.cognito.signin.user.admin
+
+#     Metadata:
+#       BuildMethod: esbuild
+#       BuildProperties:
+#         EntryPoints:
+#           - src/lambda/accounts/GetAccounts.ts
+#         Format: cjs
+#         Target: es2022
+#         Bundle: true
+#         Minify: false
+#         Sourcemap: true
+
+
+#   # ================================================
+#   # API GATEWAY
+#   # ================================================
+
+#   BankManagementApi:
+#     Type: AWS::Serverless::Api
+#     Properties:
+#       Name: BankManagementAPI
+#       Description: Bank Management REST API
+#       StageName: prod
+#       EndpointConfiguration: REGIONAL
+
+#       Cors:
+#         AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+#         AllowHeaders: "'Content-Type,Authorization'"
+#         AllowOrigin: "'*'"
+
+#       Auth:
+#         Authorizers:
+#           BankCognitoAuthorizer:
+#             UserPoolArn: !GetAtt BankUserPool.Arn
+#             Identity:
+#               Header: Authorization
+
+
+# # --------------------------------------------------
+# # OUTPUTS
+# # --------------------------------------------------
+
+# Outputs:
+
+#   # DynamoDB table names
+
+#   CustomersTableName:
+#     Description: Customers DynamoDB Table
+#     Value: !Ref CustomersTable
+
+#   AccountsTableName:
+#     Description: Accounts DynamoDB Table
+#     Value: !Ref AccountsTable
+
+#   TransactionsTableName:
+#     Description: Transactions DynamoDB Table
+#     Value: !Ref TransactionsTable
+
+#   NotificationsTableName:
+#     Description: Notifications DynamoDB Table
+#     Value: !Ref NotificationsTable
+
+#   PendingMaintenancesTableName:
+#     Description: Pending Maintenances DynamoDB Table
+#     Value: !Ref PendingMaintenancesTable
+
+#   # Cognito details
+
+#   BankUserPoolId:
+#     Description: Cognito User Pool ID
+#     Value: !Ref BankUserPool
+
+#   BankUserPoolClientId:
+#     Description: Cognito App Client ID
+#     Value: !Ref BankUserPoolClient
+
+#   AdminGroupName:
+#     Description: Cognito Administrator Group
+#     Value: !Ref AdminUserGroup
+
+#   CustomerGroupName:
+#     Description: Cognito Customer Group
+#     Value: !Ref CustomerUserGroup
+
+#   # Customer Lambda ARNs
+
+#   CreateCustomerFunctionArn:
+#     Description: Create Customer Lambda ARN
+#     Value: !GetAtt CreateCustomerFunction.Arn
+
+#   GetCustomersFunctionArn:
+#     Description: Get Customers Lambda ARN
+#     Value: !GetAtt GetCustomersFunction.Arn
+
+#   GetCustomerByIdFunctionArn:
+#     Description: Get Customer By ID Lambda ARN
+#     Value: !GetAtt GetCustomerByIdFunction.Arn
+
+#   EditCustomerFunctionArn:
+#     Description: Edit Customer Lambda ARN
+#     Value: !GetAtt EditCustomerFunction.Arn
+
+#   DeleteCustomerFunctionArn:
+#     Description: Delete Customer Lambda ARN
+#     Value: !GetAtt DeleteCustomerFunction.Arn
+
+#   LoginCustomerFunctionArn:
+#     Description: Login Customer Lambda ARN
+#     Value: !GetAtt LoginCustomerFunction.Arn
+
+#   # API Gateway details
+
+#   BankManagementApiId:
+#     Description: Bank Management API Gateway ID
+#     Value: !Ref BankManagementApi
+
+#   BankManagementApiUrl:
+#     Description: Bank Management API Gateway Invoke URL
+#     Value: !Sub
+#       - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/prod
+#       - ApiId: !Ref BankManagementApi
