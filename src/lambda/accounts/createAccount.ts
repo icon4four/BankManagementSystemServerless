@@ -1,14 +1,10 @@
 
 import type { APIGatewayProxyEvent , APIGatewayProxyResult } from "aws-lambda";
 
-import { PutCommand , ScanCommand } from "@aws-sdk/lib-dynamodb";
-
-// import { cognito } from "../../services/cognitoService.js";
-// import { DynamoDB } from "@aws-sdk/client-dynamodb";
-
 import type { Account } from "../../types/account.js";
 import { response } from "../../helpers/response.js";
-import { dynamoDB } from "../../services/dynamodbService.js";
+
+import { Ids,prefixIds } from "../../utils/IndexUtils.js";
 
 import { IdList ,PutOperation } from "../../services/dynamodbService.js";
 
@@ -25,27 +21,15 @@ export const handler = async(
         const input = JSON.parse(event.body!);
 
         //generate the next accountId
+
+
+
         const result =await IdList(TABLE_NAME,["accountId","accountNumber"])
-        // const result = await dynamoDB.send(
-        //     new ScanCommand({
-        //         TableName:TABLE_NAME,
-        //         ProjectionExpression:"accountId,accountNumber"
-        //     })
-        // );
-        const accounts = result.Items ?? [] ;
-        const accountIds = accounts.map(
-            (item)=>Number(item.accountId)
-        );
+      
 
-        const accountId=Math.max(9999, ...accountIds)+1;
-
-        // generate the next account number
-
-        const accountNumbers=accounts.map(
-            (item)=>Number(String(item.accountNumber).slice(2))
-        )
-        const accountNumberValue = Math.max(999999999 , ...accountNumbers)+1;
-        const accountNumber = "SB"+accountNumberValue;
+        const accountId=await Ids(result.Items??[],"accountId",9999)
+        const accountNumber=await prefixIds(result.Items??[],"accountNumber","SB",999999999)
+       
 
         //create the date to add
 
@@ -60,19 +44,13 @@ export const handler = async(
             branch:input.branch,
             status:"ACTIVE",
             account_archived:false,
-            createdAt:currentDate
+            createdAt:currentDate,
+            updatedAt:currentDate
         };
 
         await PutOperation(TABLE_NAME,account,"accountId");
 
-        // await dynamoDB.send(
-        //     new PutCommand({
-        //         TableName:TABLE_NAME,
-        //         Item:account,
-        //         ConditionExpression:"attribute_not_exists(accountId)",
-        //     })
-        // );
-
+      
         return response(201 , {
             success:true,
             message:"Account created successfully",

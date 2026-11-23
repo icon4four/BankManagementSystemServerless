@@ -1,8 +1,6 @@
 import type { APIGatewayProxyEvent,APIGatewayProxyResult,} from "aws-lambda";
-import {SignUpCommand, AdminConfirmSignUpCommand,  AdminAddUserToGroupCommand,} from "@aws-sdk/client-cognito-identity-provider";
-import {PutCommand, ScanCommand,} from "@aws-sdk/lib-dynamodb";
-import { cognito } from "../../services/cognitoService.js";
-import { dynamoDB } from "../../services/dynamodbService.js";
+
+import { IdList} from "../../services/dynamodbService.js";
 
 import type { Customer } from "../../types/customer.js";
 import { response } from "../../helpers/response.js";
@@ -29,46 +27,22 @@ export const handler = async (
     //step 2: decrpt the encrypted password
     const decryptedPassword = await decryptPassword(input.password);
 
-    // Step 3: Generate the next customer ID by sending the table name , projectionExpression ,customerId value
+    // Step 3: Get the customer table value of customerId
+    const customers = await IdList(CUSTOMER_TABLE_NAME,["customerId"]);
 
-    const customerId=await Ids(CUSTOMER_TABLE_NAME,["customerId"],999);
+    //STEP 4: Generate customerId
+    const customerId=await Ids(customers.Items??[],"customerId",999)
   
-    // Step 4: Create user in Cognito
+    // Step 5: Create user in Cognito
     const cognitoResult = await CognitoResult(APP_CLIENT_ID,input.email,decryptedPassword,"email");
-    // const cognitoResult = await cognito.send(
-    //   new SignUpCommand({
-    //     ClientId: APP_CLIENT_ID,
-    //     Username: input.email,
-    //     Password: decryptedPassword,
-    //     UserAttributes: [
-    //       {
-    //         Name: "email",
-    //         Value: input.email,
-    //       },
-    //     ],
-    //   })
-    // );
-
-    // Step 5: Confirm the Cognito user
+    
+    // Step 6: Confirm the Cognito user
     await confirmCognito(USER_POOL_ID,input.email)
-    // await cognito.send(
-    //   new AdminConfirmSignUpCommand({
-    //     UserPoolId: USER_POOL_ID,
-    //     Username: input.email,
-    //   })
-    // );
-
-    // Step 6: Add the user to the selected Cognito group
+    
+    // Step 7: Add the user to the selected Cognito group
     await Cognito_Group(USER_POOL_ID,input.email,input.role);
-    // await cognito.send(
-    //   new AdminAddUserToGroupCommand({
-    //     UserPoolId: USER_POOL_ID,
-    //     Username: input.email,
-    //     GroupName: input.role,
-    //   })
-    // );
-
-    // Step 7: Prepare customer profile
+    
+    // Step 8: Prepare customer profile
     const currentDate = new Date().toISOString();
 
     const customer: Customer = {
@@ -87,15 +61,8 @@ export const handler = async (
       updatedAt: currentDate,
     };
 
-    // Step 8: Store customer details in DynamoDB
+    // Step 9: Store customer details in DynamoDB
     await PutOperation(CUSTOMER_TABLE_NAME,customer,"customerId");
-    // await dynamoDB.send( 
-    //   new PutCommand({
-    //     TableName: TABLE_NAME,
-    //     Item: customer,
-    //     ConditionExpression: "attribute_not_exists(customerId)",
-    //   })
-    // );
 
     console.log(`Customer ${customerId} registered successfully`);
 

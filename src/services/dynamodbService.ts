@@ -79,16 +79,32 @@ export const GSItableValues = async (TABLE_NAME: string,indexName: string,condit
 }
 
 
-//  Updating values in DynamoDB -editCustomer
+
 
 export const updateTableValues = (
   TABLE_NAME: string,
   key: Record<string, string | number>,
-  updateExpressions: string[],
-  expressionAttributeNames: Record<string, string>,
-  expressionAttributeValues: Record<string, unknown>,
-  conditionExpression?: string
+  updates: Record<string, unknown>
 ) => {
+  const updateExpressions: string[] = [];
+
+  const expressionAttributeNames: Record<string, string> = {};
+  const expressionAttributeValues: Record<string, unknown> = {};
+
+  Object.entries(updates).forEach(([field, value], index) => {
+    const name = `#field${index}`;
+    const valueKey = `:value${index}`;
+
+    updateExpressions.push(`${name} = ${valueKey}`);
+
+    expressionAttributeNames[name] = field;
+    expressionAttributeValues[valueKey] = value;
+  });
+
+  if (updateExpressions.length === 0) {
+    throw new Error("No fields provided for update.");
+  }
+
   return dynamoDB.send(
     new UpdateCommand({
       TableName: TABLE_NAME,
@@ -96,7 +112,6 @@ export const updateTableValues = (
       UpdateExpression: `SET ${updateExpressions.join(", ")}`,
       ExpressionAttributeNames: expressionAttributeNames,
       ExpressionAttributeValues: expressionAttributeValues,
-      ConditionExpression: conditionExpression,
       ReturnValues: "ALL_NEW",
     })
   );

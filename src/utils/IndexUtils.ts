@@ -1,28 +1,22 @@
 
  import { IdList } from "../services/dynamodbService.js";
- export const  Ids = async(TableName:string,projectionValue:string[],startValue:number)=>{
+ export const  Ids = async(items:Record<string,unknown>[],fieldName:string,startValue:number)=>{
 
-     const result = await IdList(TableName,projectionValue);
-
-    const IDS = (result.Items ?? []).map(
-       (item) => Number(item.customerId)
-     );
+     //const result = await IdList(TableName,projectionValue);
+    const IDS = items.map(
+       (item) => Number(item[fieldName])
+     ).filter(Number.isFinite)
 
      const Id = Math.max(startValue, ...IDS) + 1;
      return Id;
  }
 
+export const prefixIds = async(items:Record<string,unknown>[],fieldName:string,prefix:string,startValue:number)=>{
+    const IDS =items.map(
+        (item)=>Number(String(item[fieldName]).slice(2))
 
- // group name of the cognito
- export const groupName = (claims:any)=>{
-    const groupsClaim = claims?.["cognito:groups"];
-    const groups =
-      typeof groupsClaim === "string"
-        ? groupsClaim.startsWith("[")
-          ? JSON.parse(groupsClaim)
-          : groupsClaim.split(",")
-        : Array.isArray(groupsClaim)
-          ? groupsClaim
-          : [];
-    return groups
- }
+    )
+    const accNumVal=Math.max(startValue , ...IDS)+1;
+    const accNum=prefix+accNumVal;
+    return accNum;
+}

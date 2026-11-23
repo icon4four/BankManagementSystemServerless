@@ -8,4 +8,5 @@ export interface Account{
     status:string;
     account_archived:boolean;
     createdAt:string;
+    updatedAt:string;
 }

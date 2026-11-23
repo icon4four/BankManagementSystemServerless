@@ -1,12 +1,13 @@
 
 import type { APIGatewayProxyEvent,  APIGatewayProxyResult,} from "aws-lambda";
 
-import { GetCommand, QueryCommand, TransactWriteCommand,} from "@aws-sdk/lib-dynamodb";
-
-import { dynamoDB } from "../../services/dynamodbService.js";
 import { response } from "../../helpers/response.js";
 
-import { getTableValue ,GSItableValues } from "../../services/dynamodbService.js";
+import { getTableValue ,GSItableValues, updateTableValues} from "../../services/dynamodbService.js";
+
+import { groupName } from "../../utils/groupNameUtil.js";
+
+import { role } from "../../utils/groupByRoleUtil.js";
 
 const CUSTOMERS_TABLE = process.env.CUSTOMERS_TABLE!;
 const ACCOUNTS_TABLE = process.env.ACCOUNTS_TABLE!;
@@ -22,56 +23,26 @@ export const handler = async (
 
     const claims = event.requestContext.authorizer?.claims;
 
-    const cognitoSub = claims?.sub;
-    const groupsClaim = claims?.["cognito:groups"];
+    //const cognitoSub = claims?.sub;
 
-    const groups =
-      typeof groupsClaim === "string"
-        ? groupsClaim.startsWith("[")
-          ? JSON.parse(groupsClaim)
-          : groupsClaim.split(",")
-        : Array.isArray(groupsClaim)
-          ? groupsClaim
-          : [];
+    const groups = groupName(claims)
 
-    const isAdmin = groups.includes("ADMIN");
-    const isCustomer = groups.includes("CUSTOMER");
 
     // Step 2: Retrieve customer
-    const customerResult =await getTableValue(CUSTOMERS_TABLE,"customerId",customerId)
-    // const customerResult = await dynamoDB.send(
-    //   new GetCommand({
-    //     TableName: CUSTOMERS_TABLE,
-    //     Key: {
-    //       customerId,
-    //     },
-    //   })
-    // );
+    const customerDetail =await getTableValue(CUSTOMERS_TABLE,"customerId",customerId)
+  
 
-    const customer = customerResult.Item;
+    const correctRole=role(customerDetail.Item,groups)
 
-    if (!customer) {
-      return response(404, {
-        success: false,
-        message: "Customer not found.",
-      });
-    }
-
-    // Step 3: Check authorization
-    if (!isAdmin) {
-      if (
-        !isCustomer ||
-        customer.cognitoSub !== cognitoSub
-      ) {
-        return response(403, {
-          success: false,
-          message: "You are not authorised to delete this customer.",
-        });
-      }
+     if(correctRole===false){
+      return response(403,{
+        success:false,
+        message:"You are not authorised to edit this customer"
+      })
     }
 
     // Step 4: Check whether customer is already inactive
-    if (customer.status !== "ACTIVE" || customer.customer_archived) {
+    if (customerDetail.Item!.status !== "ACTIVE" || customerDetail.Item!.customer_archived) {
       return response(400, {
         success: false,
         message: "Customer is already inactive.",
@@ -79,20 +50,11 @@ export const handler = async (
     }
 
     // Step 5: Retrieve all accounts belonging to the customer
-    const accountsResult = await GSItableValues(ACCOUNTS_TABLE,"CustomerIdIndex","customerId",customerId)
+    const allAccountDetail = await GSItableValues(ACCOUNTS_TABLE,"CustomerIdIndex","customerId",customerId)
     
-    // const accountsResult = await dynamoDB.send(
-    //   new QueryCommand({
-    //     TableName: ACCOUNTS_TABLE,
-    //     IndexName: "CustomerIdIndex",
-    //     KeyConditionExpression: "customerId = :customerId",
-    //     ExpressionAttributeValues: {
-    //       ":customerId": customerId,
-    //     },
-    //   })
-    // );
+   
 
-    const accounts = accountsResult.Items ?? [];
+    const accounts = allAccountDetail.Items ?? [];
 
     // Step 6: Check that all account balances are zero
     const hasBalance = accounts.some(
@@ -107,84 +69,37 @@ export const handler = async (
       });
     }
 
-    // Step 7: Check that all accounts are active
-    // const hasInactiveAccount = accounts.some(
-    //   (account) => account.status !== "ACTIVE"
-    // );
-
-    // if (hasInactiveAccount) {
-    //   return response(400, {
-    //     success: false,
-    //     message:
-    //       "Customer cannot be deactivated because one or more accounts are already inactive.",
-    //   });
-    // }
 
     // Step 8: Prepare transaction updates
     const currentDate = new Date().toISOString();
 
-    const transactionItems = [
-      ...accounts.map((account) => ({
-        Update: {
-          TableName: ACCOUNTS_TABLE,
-          Key: {
-            accountId: account.accountId,
-          },
-          UpdateExpression:
-            "SET #status = :status, updatedAt = :updatedAt",
-          ExpressionAttributeNames: {
-            "#status": "status",
-          },
-          ExpressionAttributeValues: {
-            ":status": "INACTIVE",
-            ":updatedAt": currentDate,
-            ":zero": 0,
-            ":active": "ACTIVE",
-          },
-          ConditionExpression:
-            "attribute_exists(accountId) AND balance = :zero AND #status = :active",
-        },
-      })),
-
-      {
-        Update: {
-          TableName: CUSTOMERS_TABLE,
-          Key: {
-            customerId,
-          },
-          UpdateExpression:
-            "SET #status = :status, customer_archived = :archived, updatedAt = :updatedAt",
-          ExpressionAttributeNames: {
-            "#status": "status",
-          },
-          ExpressionAttributeValues: {
-            ":status": "INACTIVE",
-            ":archived": true,
-            ":updatedAt": currentDate,
-            ":active": "ACTIVE",
-            ":notArchived": false,
-          },
-          ConditionExpression:
-            "attribute_exists(customerId) AND #status = :active AND customer_archived = :notArchived",
-        },
-      },
-    ];
-
-    // DynamoDB transactions support a maximum of 100 actions
-    if (transactionItems.length > 100) {
-      return response(400, {
-        success: false,
-        message: "Too many accounts to deactivate in one transaction.",
-      });
+for (const account of accounts) {
+  await updateTableValues(
+    ACCOUNTS_TABLE,
+    {
+      accountId: account.accountId,
+    },
+    {
+      status: "INACTIVE",
+      account_archived: false,
+      updatedAt: currentDate,
     }
+  );
+}
 
-    // Step 9: Update all accounts and customer atomically
-    //need to work here 
-    await dynamoDB.send(
-      new TransactWriteCommand({
-        TransactItems: transactionItems,
-      })
-    );
+console.log("All customer accounts deactivated successfully");
+
+await updateTableValues(
+  CUSTOMERS_TABLE,
+  {
+    customerId,
+  },
+  {
+    status: "INACTIVE",
+    customer_archived: false,
+    updatedAt: currentDate,
+  }
+);
 
     console.log(`Customer ${customerId} deactivated successfully`);
 

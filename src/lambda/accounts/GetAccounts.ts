@@ -6,7 +6,9 @@ import { QueryCommand } from "@aws-sdk/lib-dynamodb";
 
 import { GSItableValues } from "../../services/dynamodbService.js";
 
-const TABLE_NAME=process.env.ACCOUNTS_TABLE!
+import { groupName } from "../../utils/groupNameUtil.js";
+
+const ACCOUNT_TABLE_NAME=process.env.ACCOUNTS_TABLE!
 const CUSTOMER_TABLE=process.env.CUSTOMERS_TABLE!
 
 export const handler = async(
@@ -16,16 +18,18 @@ export const handler = async(
         console.log("GetAccounts lambda invoked");
         const claims = event.requestContext.authorizer?.claims
         const cognitoSub = claims?.sub;
-        const groupsClaim = claims?.["cognito:groups"];
 
-        const group =
-                  typeof groupsClaim === "string"
-                     ? groupsClaim.startsWith("[")
-                     ?JSON.parse(groupsClaim)
-                     :groupsClaim.split(",")
-                     :Array.isArray(groupsClaim)
-                     ?groupsClaim
-                     :[];
+        const group=groupName(claims)
+        // const groupsClaim = claims?.["cognito:groups"];
+
+        // const group =
+        //           typeof groupsClaim === "string"
+        //              ? groupsClaim.startsWith("[")
+        //              ?JSON.parse(groupsClaim)
+        //              :groupsClaim.split(",")
+        //              :Array.isArray(groupsClaim)
+        //              ?groupsClaim
+        //              :[];
         // when the user is CUSTOMER
         if(group.includes("CUSTOMER")){
 
@@ -46,7 +50,7 @@ export const handler = async(
 //don't know if this works
             const accounts = await dynamoDB.send(
                 new QueryCommand({
-                    TableName:TABLE_NAME,
+                    TableName:ACCOUNT_TABLE_NAME,
                     IndexName:"CustomerIdIndex",
                     KeyConditionExpression:"customerId=:customerId",
                      FilterExpression: "account_archived = :archived",
@@ -71,7 +75,7 @@ export const handler = async(
         else{
             const account = await dynamoDB.send(
                 new ScanCommand({
-                    TableName:TABLE_NAME,
+                    TableName:ACCOUNT_TABLE_NAME,
                     FilterExpression: "account_archived = :archived",
                     ExpressionAttributeValues: {
                         ":archived": false,
